@@ -1,0 +1,47 @@
+# This buildspec was developed to build a Spring Boot 2.3 Java 15 application atop the aws/codebuild/standard:4.0 image
+
+version: 0.2
+
+cache:
+  paths:
+    - '/root/.m2/**/*'
+    
+phases:
+  pre_build:
+    commands:
+      - aws --version
+      - pip3 install awscli --upgrade --user
+      - aws --version
+      - echo Logging into ECR 
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username $ECR_USER --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 --storage-driver=overlay&
+      - timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
+      - apt remove java-11-amazon-corretto-jdk java-1.8.0-amazon-corretto -y
+      - wget -qO - https://adoptopenjdk.jfrog.io/adoptopenjdk/api/gpg/key/public | apt-key add -
+      - add-apt-repository --yes https://adoptopenjdk.jfrog.io/adoptopenjdk/deb/
+      - apt install -qy software-properties-common
+      - apt install -qy adoptopenjdk-15-hotspot
+  build:
+    commands:
+      - mvn -v
+      - echo build started on `date`
+      - mvn clean package -s settings.xml --batch-mode
+      - mvn spring-boot:build-image -s settings.xml --batch-mode
+      - echo build completed on `date`
+      - echo Tagging image...
+      - docker tag docker.io/library/service:0.0.1-SNAPSHOT $REPOSITORY_URI/$IMAGE_REPO_NAME:$IMAGE_TAG 
+  post_build:
+    commands:
+      - echo Pushing the Docker image to ECR
+      - docker push $REPOSITORY_URI/$IMAGE_REPO_NAME:$IMAGE_TAG 
+      - git clone https://<your_configuration_repo_url_and_access_token>.git config_repo
+      - cd config_repo
+      - kubectl patch --local -f deployment.yml -p '{"spec":{"template":{"spec":{"containers":[{"name":"app","image":"'$REPOSITORY_URI/$IMAGE_REPO_NAME:$IMAGE_TAG'"}]}}}}' -o yaml > new-deployment.yml
+      - mv new-deployment.yml deployment.yml
+      - git config --global user.email "<your_email>@<your_domain>.com"
+      - git config --global user.name "<your_ci/cd_user>"
+      - git commit -am "CI/CD pipeline updated $IMAGE_REPO_NAME image to new image tag"
+      - git push origin master
